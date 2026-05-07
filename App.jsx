@@ -22,34 +22,30 @@ const STORAGE_KEY = "payroll_recon_v3";
 const Storage = {
   save: async (key, value) => {
     try {
-      localStorage.setItem(key, JSON.stringify(value));
+      await window.storage.set(key, JSON.stringify(value), false);
     } catch (e) {
       console.error("Storage save failed:", e);
     }
   },
   load: async (key) => {
     try {
-      const result = localStorage.getItem(key);
-      return result ? JSON.parse(result) : null;
+      const result = await window.storage.get(key, false);
+      return result ? JSON.parse(result.value) : null;
     } catch (e) {
       return null;
     }
   },
   delete: async (key) => {
     try {
-      localStorage.removeItem(key);
+      await window.storage.delete(key, false);
     } catch (e) {
       console.error("Storage delete failed:", e);
     }
   },
   list: async (prefix) => {
     try {
-      const keys = [];
-      for (let i = 0; i < localStorage.length; i++) {
-        const k = localStorage.key(i);
-        if (k && k.startsWith(prefix)) keys.push(k);
-      }
-      return keys;
+      const result = await window.storage.list(prefix, false);
+      return result?.keys || [];
     } catch (e) {
       console.error("Storage list failed:", e);
       return [];
@@ -60,22 +56,20 @@ const Storage = {
 // ── AI Integration ────────────────────────────────────────────────────────────
 async function callClaudeAPI(messages, systemPrompt = "") {
   try {
-    const response = await fetch("/api/claude", {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 1000,
         system: systemPrompt,
         messages: messages,
       }),
     });
 
     const data = await response.json();
-    if (data.error) {
-      console.error("Claude API error:", data.error);
-      return null;
-    }
     return data.content.map(item => item.type === "text" ? item.text : "").join("\n");
   } catch (error) {
     console.error("Claude API error:", error);
@@ -295,12 +289,13 @@ function parseCSV(text) {
   });
 }
 
-function readFile(file) {
+// Returns { sheetNames, rawBuffer } for xlsx, or { sheetNames:["Sheet1"], rawBuffer:null, text } for csv
+function readFileMeta(file) {
   return new Promise((resolve, reject) => {
     const ext = file.name.split(".").pop().toLowerCase();
     const reader = new FileReader();
     if (["csv","tsv","txt"].includes(ext)) {
-      reader.onload = (e) => { try { resolve(parseCSV(e.target.result)); } catch (err) { reject(err); } };
+      reader.onload = (e) => resolve({ sheetNames:["Sheet1"], rawBuffer:null, text:e.target.result, ext });
       reader.onerror = reject;
       reader.readAsText(file);
     } else if (["xlsx","xls"].includes(ext)) {
@@ -314,9 +309,9 @@ function readFile(file) {
               document.head.appendChild(s);
             });
           }
-          const wb = window.XLSX.read(new Uint8Array(e.target.result), { type:"array" });
-          const ws = wb.Sheets[wb.SheetNames[0]];
-          resolve(window.XLSX.utils.sheet_to_json(ws, { defval:"" }));
+          const buf = e.target.result;
+          const wb = window.XLSX.read(new Uint8Array(buf), { type:"array" });
+          resolve({ sheetNames: wb.SheetNames, rawBuffer: buf, ext });
         } catch (err) { reject(err); }
       };
       reader.onerror = reject;
@@ -326,6 +321,22 @@ function readFile(file) {
     }
   });
 }
+
+function parseSheetFromMeta(meta, sheetName) {
+  if (meta.ext === "csv" || meta.ext === "tsv" || meta.ext === "txt") {
+    return parseCSV(meta.text);
+  }
+  const wb = window.XLSX.read(new Uint8Array(meta.rawBuffer), { type:"array" });
+  const ws = wb.Sheets[sheetName || wb.SheetNames[0]];
+  if (!ws) throw new Error(`Sheet "${sheetName}" not found`);
+  return window.XLSX.utils.sheet_to_json(ws, { defval:"" });
+}
+
+// Legacy compat — used by PDF/Excel export paths that don't need sheet selection
+function readFile(file) {
+  return readFileMeta(file).then(meta => parseSheetFromMeta(meta, meta.sheetNames[0]));
+}
+
 
 // ── Enhanced PDF Export with AI Summary ───────────────────────────────────────
 async function exportToPDF(reconData, reviewStatuses, comments, aiAnalysis) {
@@ -944,78 +955,57 @@ function NavItem({ icon, label, active, disabled, onClick }) {
 // ── Upload View ───────────────────────────────────────────────────────────────
 function UploadView({ onDemoNext, onRealNext }) {
   const [mode, setMode] = useState(null);
-  const [fileA, setFileA] = useState(null);
-  const [fileB, setFileB] = useState(null);
   const [labelA, setLabelA] = useState("");
   const [labelB, setLabelB] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
-  const handleFiles = async () => {
-    console.log("=== BUTTON CLICKED ===");
-    console.log("File A:", fileA);
-    console.log("File B:", fileB);
-    console.log("Label A:", labelA);
-    console.log("Label B:", labelB);
-    
-    if (!fileA || !fileB || !labelA || !labelB) {
-      const missing = [];
-      if (!fileA) missing.push("File A");
-      if (!fileB) missing.push("File B");
-      if (!labelA) missing.push("Label A");
-      if (!labelB) missing.push("Label B");
-      setError(`Missing: ${missing.join(", ")}`);
-      console.error("Missing fields:", missing);
-      return;
-    }
-    
+  // Per-file: file object, parsed meta (sheet names + buffer), selected sheet
+  const [metaA, setMetaA] = useState(null);  // { sheetNames, rawBuffer, ext, ... }
+  const [metaB, setMetaB] = useState(null);
+  const [sheetA, setSheetA] = useState("");
+  const [sheetB, setSheetB] = useState("");
+  const [loadingA, setLoadingA] = useState(false);
+  const [loadingB, setLoadingB] = useState(false);
+
+  const handleFileChange = async (which, file) => {
+    if (!file) return;
+    const setLoading = which === "A" ? setLoadingA : setLoadingB;
+    const setMeta    = which === "A" ? setMetaA    : setMetaB;
+    const setSheet   = which === "A" ? setSheetA   : setSheetB;
     setLoading(true);
-    setError("");
-    
     try {
-      console.log("Starting file reading...");
-      console.log("File A details:", {
-        name: fileA.name,
-        size: fileA.size,
-        type: fileA.type
-      });
-      console.log("File B details:", {
-        name: fileB.name,
-        size: fileB.size,
-        type: fileB.type
-      });
-      
-      const [dataA, dataB] = await Promise.all([readFile(fileA), readFile(fileB)]);
-      
-      console.log("Files read successfully!");
-      console.log("Data A:", {
-        rows: dataA.length,
-        columns: Object.keys(dataA[0] || {}),
-        sample: dataA[0]
-      });
-      console.log("Data B:", {
-        rows: dataB.length,
-        columns: Object.keys(dataB[0] || {}),
-        sample: dataB[0]
-      });
-      
-      if (dataA.length === 0 || dataB.length === 0) {
-        throw new Error("One or both files are empty. Please check your files.");
-      }
-      
-      console.log("Calling onRealNext...");
-      onRealNext({ dataA, dataB, labelA, labelB });
-      console.log("onRealNext called successfully!");
-      
+      const meta = await readFileMeta(file);
+      setMeta(meta);
+      setSheet(meta.sheetNames[0]);
     } catch (err) {
-      console.error("=== FILE READING ERROR ===");
-      console.error("Error details:", err);
-      console.error("Error message:", err.message);
-      console.error("Error stack:", err.stack);
-      setError(err.message || "Failed to read files. Please check the file format.");
+      setError(`File ${which}: ${err.message}`);
     } finally {
       setLoading(false);
-      console.log("=== PROCESS COMPLETE ===");
+    }
+  };
+
+  const handleContinue = async () => {
+    if (!metaA || !metaB || !labelA || !labelB) {
+      const missing = [];
+      if (!metaA)   missing.push("Source A file");
+      if (!metaB)   missing.push("Source B file");
+      if (!labelA)  missing.push("Source A label");
+      if (!labelB)  missing.push("Source B label");
+      setError(`Missing: ${missing.join(", ")}`);
+      return;
+    }
+    setLoading(true);
+    setError("");
+    try {
+      const dataA = parseSheetFromMeta(metaA, sheetA);
+      const dataB = parseSheetFromMeta(metaB, sheetB);
+      if (dataA.length === 0 || dataB.length === 0) throw new Error("One or both selected sheets are empty.");
+      onRealNext({ dataA, dataB, labelA, labelB });
+    } catch (err) {
+      setError(err.message || "Failed to read files.");
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -1032,7 +1022,7 @@ function UploadView({ onDemoNext, onRealNext }) {
           <div style={{ ...gs.card, cursor:"pointer", transition:"all 0.2s" }} onClick={() => setMode("demo")} onMouseEnter={e => e.currentTarget.style.boxShadow = C.cardShadowHover} onMouseLeave={e => e.currentTarget.style.boxShadow = C.cardShadow}>
             <div style={{ fontSize:40, marginBottom:16 }}>🚀</div>
             <h3 style={{ fontSize:20, fontWeight:700, marginBottom:8 }}>Demo Mode</h3>
-            <p style={{ color:C.textDim, fontSize:14 }}>Explore V2 features with pre-loaded sample data including AI analysis</p>
+            <p style={{ color:C.textDim, fontSize:14 }}>Explore V3 features with pre-loaded sample data including AI analysis</p>
           </div>
           <div style={{ ...gs.card, cursor:"pointer", transition:"all 0.2s" }} onClick={() => setMode("real")} onMouseEnter={e => e.currentTarget.style.boxShadow = C.cardShadowHover} onMouseLeave={e => e.currentTarget.style.boxShadow = C.cardShadow}>
             <div style={{ fontSize:40, marginBottom:16 }}>📊</div>
@@ -1043,13 +1033,13 @@ function UploadView({ onDemoNext, onRealNext }) {
         <div style={{ ...gs.card, marginTop:30, background:C.accent+"0A", border:`1px solid ${C.accent}44` }}>
           <h4 style={{ fontSize:16, fontWeight:700, marginBottom:12, color:C.accent }}>✨ New in Version 3</h4>
           <ul style={{ margin:0, paddingLeft:20, color:C.textDim, fontSize:14 }}>
-            <li>LPR / PPR element-to-element reconciliation (legacy vs new, per pay run)</li>
-            <li>YTD balance side-by-side comparison — legacy vs new + cumulative period chart</li>
-            <li>Gross composition breakdown — each element's contribution with % and variance</li>
-            <li>Config Check — how each element was loaded (Manual / Interface / Migration / Formula)</li>
-            <li>Element type classification (Earnings / Deduction / Information / Balance)</li>
-            <li>Migration element flagging — highlights elements loaded from legacy during go-live</li>
-            <li>AI Config Review — AI spots configuration risks in UK LDG and other LDG contexts</li>
+            <li>Multi-sheet Excel support — pick which sheet to use per file</li>
+            <li>Full column union mapping — all columns from both sources shown</li>
+            <li>Many-to-one and one-to-many element mapping</li>
+            <li>Gross composition & element type set at mapping stage</li>
+            <li>Download / upload element mapping sheet (with type &amp; Gross flag)</li>
+            <li>LPR / PPR element-to-element + YTD balance reconciliation</li>
+            <li>Editable Config Check per employee</li>
           </ul>
         </div>
       </div>
@@ -1063,7 +1053,7 @@ function UploadView({ onDemoNext, onRealNext }) {
           <div style={{ fontSize:48, textAlign:"center", marginBottom:20 }}>🎯</div>
           <h2 style={{ fontSize:28, fontWeight:700, textAlign:"center", marginBottom:12 }}>Demo Mode Ready</h2>
           <p style={{ textAlign:"center", color:C.textDim, marginBottom:30, fontSize:15 }}>
-            Experience V2 features with 8 sample employees including AI variance analysis, risk scoring, and executive summaries.
+            Experience V3 features with 8 sample employees including AI variance analysis, risk scoring, and executive summaries.
           </p>
           <div style={{ display:"flex", gap:12, justifyContent:"center" }}>
             <button style={gs.btn("primary")} onClick={onDemoNext}>Launch Demo</button>
@@ -1074,85 +1064,84 @@ function UploadView({ onDemoNext, onRealNext }) {
     );
   }
 
+  // ── Real Data Upload ──────────────────────────────────────────────────────
+  const FileBlock = ({ which, label, setLabel, labelPlaceholder, meta, sheet, setSheet, loadingFile }) => (
+    <div style={{ padding:20, borderRadius:10, border:`1px solid ${C.border}`, background:C.bg, marginBottom:20 }}>
+      <div style={{ fontSize:13, fontWeight:700, color:C.accent, marginBottom:12 }}>
+        Source {which}
+      </div>
+      <label style={{ display:"block", fontWeight:600, marginBottom:6, fontSize:13 }}>Label</label>
+      <input
+        type="text"
+        placeholder={labelPlaceholder}
+        style={{...gs.input, marginBottom:14}}
+        value={label}
+        onChange={e => setLabel(e.target.value)}
+      />
+      <label style={{ display:"block", fontWeight:600, marginBottom:6, fontSize:13 }}>File (.csv / .xlsx / .xls / .tsv)</label>
+      <input
+        type="file"
+        accept=".csv,.xlsx,.xls,.tsv,.txt"
+        onChange={e => handleFileChange(which, e.target.files[0])}
+        style={{ fontSize:13, width:"100%", marginBottom:10 }}
+      />
+      {loadingFile && <div style={{ fontSize:12, color:C.amber }}>⏳ Reading sheets…</div>}
+      {meta && !loadingFile && (
+        <div style={{ marginTop:8 }}>
+          <div style={{ fontSize:12, color:C.green, fontWeight:600, marginBottom:8 }}>
+            ✓ {meta.sheetNames.length} sheet{meta.sheetNames.length > 1 ? "s" : ""} detected
+          </div>
+          {meta.sheetNames.length > 1 ? (
+            <>
+              <label style={{ display:"block", fontWeight:600, marginBottom:6, fontSize:13 }}>Select Sheet to Use</label>
+              <div style={{ display:"flex", flexWrap:"wrap", gap:8 }}>
+                {meta.sheetNames.map((sn, i) => (
+                  <button
+                    key={sn}
+                    onClick={() => setSheet(sn)}
+                    style={{
+                      padding:"7px 14px", borderRadius:7, fontSize:12, fontWeight:600, cursor:"pointer",
+                      border: sheet === sn ? `2px solid ${C.accent}` : `1px solid ${C.border}`,
+                      background: sheet === sn ? C.accent+"15" : C.surface,
+                      color: sheet === sn ? C.accent : C.text,
+                    }}
+                  >
+                    {sn} {i === 0 ? "(default)" : ""}
+                  </button>
+                ))}
+              </div>
+              <div style={{ marginTop:8, fontSize:12, color:C.textDim }}>
+                Selected: <strong>{sheet}</strong>
+              </div>
+            </>
+          ) : (
+            <div style={{ fontSize:12, color:C.textDim }}>Single sheet: <strong>{sheet}</strong></div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+
   return (
     <div style={{ maxWidth:800, margin:"0 auto" }}>
       <h2 style={{ fontSize:28, fontWeight:700, marginBottom:24 }}>Upload Payroll Files</h2>
-      
-      {/* Debug Info */}
-      <div style={{ ...gs.card, background:C.amber+"0A", border:`1px solid ${C.amber}44`, marginBottom:20 }}>
-        <h4 style={{ fontSize:14, fontWeight:700, marginBottom:8, color:C.amber }}>🔍 Status Check</h4>
-        <div style={{ fontSize:13, color:C.textDim }}>
-          <div>✓ File A: {fileA ? `${fileA.name} (${fileA.size} bytes)` : "Not selected"}</div>
-          <div>✓ File B: {fileB ? `${fileB.name} (${fileB.size} bytes)` : "Not selected"}</div>
-          <div>✓ Label A: {labelA || "Not provided"}</div>
-          <div>✓ Label B: {labelB || "Not provided"}</div>
-          <div style={{ marginTop:8, fontWeight:600, color: (fileA && fileB && labelA && labelB) ? C.green : C.red }}>
-            Button Status: {(fileA && fileB && labelA && labelB) ? "Ready to Continue ✓" : "Please complete all fields"}
-          </div>
-        </div>
-      </div>
-
       <div style={gs.card}>
-        <div style={{ marginBottom:24 }}>
-          <label style={{ display:"block", fontWeight:600, marginBottom:8, fontSize:14 }}>Source A Label (e.g., HRIS System Name)</label>
-          <input 
-            type="text" 
-            placeholder="e.g., Oracle Fusion HCM - Jul 2025" 
-            style={{...gs.input, marginBottom:12}} 
-            value={labelA} 
-            onChange={e => setLabelA(e.target.value)}
-          />
-          <label style={{ display:"block", fontWeight:600, marginBottom:8, fontSize:14 }}>Source A File</label>
-          <input 
-            type="file" 
-            accept=".csv,.xlsx,.xls,.tsv,.txt" 
-            onChange={e => {
-              const file = e.target.files[0];
-              console.log("File A selected:", file);
-              setFileA(file);
-            }} 
-            style={{ fontSize:14, width:"100%" }}
-          />
-          {fileA && <div style={{ marginTop:8, fontSize:13, color:C.green, fontWeight:600 }}>✓ {fileA.name} ({(fileA.size / 1024).toFixed(1)} KB)</div>}
-        </div>
-        <div style={{ marginBottom:24 }}>
-          <label style={{ display:"block", fontWeight:600, marginBottom:8, fontSize:14 }}>Source B Label (e.g., Payroll System Name)</label>
-          <input 
-            type="text" 
-            placeholder="e.g., RAMCO Payroll - Jul 2025" 
-            style={{...gs.input, marginBottom:12}} 
-            value={labelB} 
-            onChange={e => setLabelB(e.target.value)}
-          />
-          <label style={{ display:"block", fontWeight:600, marginBottom:8, fontSize:14 }}>Source B File</label>
-          <input 
-            type="file" 
-            accept=".csv,.xlsx,.xls,.tsv,.txt" 
-            onChange={e => {
-              const file = e.target.files[0];
-              console.log("File B selected:", file);
-              setFileB(file);
-            }} 
-            style={{ fontSize:14, width:"100%" }}
-          />
-          {fileB && <div style={{ marginTop:8, fontSize:13, color:C.green, fontWeight:600 }}>✓ {fileB.name} ({(fileB.size / 1024).toFixed(1)} KB)</div>}
-        </div>
+        <FileBlock which="A" label={labelA} setLabel={setLabelA} labelPlaceholder="e.g., Oracle Fusion HCM — Jul 2025"
+          meta={metaA} sheet={sheetA} setSheet={setSheetA} loadingFile={loadingA}/>
+        <FileBlock which="B" label={labelB} setLabel={setLabelB} labelPlaceholder="e.g., RAMCO Payroll — Jul 2025"
+          meta={metaB} sheet={sheetB} setSheet={setSheetB} loadingFile={loadingB}/>
         {error && (
           <div style={{ ...gs.badge(C.red), marginBottom:16, padding:"12px 16px", fontSize:13, display:"block" }}>
             ⚠ {error}
           </div>
         )}
         <div style={{ display:"flex", gap:12 }}>
-          <button 
-            style={{
-              ...gs.btn("primary"), 
-              opacity: (loading || !fileA || !fileB || !labelA || !labelB) ? 0.5 : 1,
-              cursor: (loading || !fileA || !fileB || !labelA || !labelB) ? "not-allowed" : "pointer"
-            }} 
-            onClick={handleFiles} 
-            disabled={loading || !fileA || !fileB || !labelA || !labelB}
+          <button
+            style={{ ...gs.btn("primary"), opacity:(loading||!metaA||!metaB||!labelA||!labelB)?0.5:1, cursor:(loading||!metaA||!metaB||!labelA||!labelB)?"not-allowed":"pointer" }}
+            onClick={handleContinue}
+            disabled={loading||!metaA||!metaB||!labelA||!labelB}
           >
-            {loading ? "🔄 Processing Files..." : "Continue to Mapping →"}
+            {loading ? "🔄 Processing…" : "Continue to Mapping →"}
           </button>
           <button style={gs.btn("ghost")} onClick={() => setMode(null)}>← Back</button>
         </div>
@@ -1162,11 +1151,15 @@ function UploadView({ onDemoNext, onRealNext }) {
 }
 
 // ── Mapping View ──────────────────────────────────────────────────────────────
+const ELEM_TYPES = ["Earnings","Deduction","Information","Balance","Other"];
+
 function MappingView({ dataA, dataB, labelA, labelB, onNext }) {
   const colsA = Object.keys(dataA[0] || {});
   const colsB = Object.keys(dataB[0] || {});
   const [idCol, setIdCol] = useState({ a: colsA[0] || "", b: colsB[0] || "" });
   const [processing, setProcessing] = useState(false);
+
+  // Original V2-style: one source-A col → one source-B col mapping
   const [elemCols, setElemCols] = useState(() => {
     const suggestions = autoSuggest(colsA.slice(1), colsB);
     return colsA.slice(1).reduce((acc, col) => {
@@ -1175,187 +1168,219 @@ function MappingView({ dataA, dataB, labelA, labelB, onNext }) {
     }, {});
   });
 
-  // Download mapping as CSV
+  // Element metadata per source-A column: elemType + inGross
+  const [elemMeta, setElemMeta] = useState(() =>
+    colsA.slice(1).reduce((acc, col) => {
+      acc[col] = { elemType: "Earnings", inGross: true };
+      return acc;
+    }, {})
+  );
+
+  const updateMeta = (col, field, val) =>
+    setElemMeta(prev => ({ ...prev, [col]: { ...prev[col], [field]: val } }));
+
+  // ── Original Download Mapping CSV ──────────────────────────────────────────
   const downloadMapping = () => {
     try {
-      let csvContent = "SourceColumn,MappedToColumn,ConfidenceScore\n";
-      
-      // ID column mapping
-      csvContent += `${idCol.a},${idCol.b},1.0\n`;
-      
-      // Element columns
+      let csv = "SourceColumn,MappedToColumn,ConfidenceScore\n";
+      csv += `${idCol.a},${idCol.b},1.0\n`;
       const suggestions = autoSuggest(colsA.slice(1), colsB);
       Object.keys(elemCols).forEach(ca => {
-        const cb = elemCols[ca] || "";
-        const score = suggestions[ca]?.score || 0;
-        csvContent += `${ca},${cb},${score.toFixed(2)}\n`;
+        csv += `${ca},${elemCols[ca] || ""},${(suggestions[ca]?.score || 0).toFixed(2)}\n`;
       });
-
-      const blob = new Blob([csvContent], { type: 'text/csv' });
+      const blob = new Blob([csv], { type:"text/csv" });
       const url = window.URL.createObjectURL(blob);
-      const a = document.createElement('a');
+      const a = document.createElement("a");
       a.href = url;
-      const fileName = `PayrollMapping_${new Date().toISOString().split('T')[0]}.csv`;
-      a.download = fileName;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
+      const fn = `PayrollMapping_${new Date().toISOString().split("T")[0]}.csv`;
+      a.download = fn;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
       window.URL.revokeObjectURL(url);
-      
-      // Show success message
-      alert(`✓ Mapping file downloaded successfully!\n\nFile: ${fileName}\n\nCheck your Downloads folder.`);
-    } catch (error) {
-      console.error("Download mapping error:", error);
-      alert("❌ Failed to download mapping file. Please try again.");
-    }
+      alert(`✓ Mapping file downloaded!\n\nFile: ${fn}\n\nCheck your Downloads folder.`);
+    } catch (err) { alert("❌ Failed to download mapping file."); }
   };
 
-  // Upload mapping from CSV
+  // ── Original Upload Mapping CSV ────────────────────────────────────────────
   const uploadMapping = (file) => {
     const reader = new FileReader();
     reader.onload = (e) => {
       try {
-        const text = e.target.result;
-        const lines = text.trim().split('\n');
+        const lines = e.target.result.trim().split("\n");
         const newElemCols = {};
         let newIdCol = { ...idCol };
-        let mappingsApplied = 0;
-
-        // Skip header
+        let count = 0;
         for (let i = 1; i < lines.length; i++) {
-          const [sourceCol, mappedCol] = lines[i].split(',').map(s => s.trim());
-          
-          if (sourceCol === idCol.a) {
-            newIdCol.b = mappedCol;
-            mappingsApplied++;
-          } else if (colsA.includes(sourceCol)) {
-            newElemCols[sourceCol] = mappedCol;
-            mappingsApplied++;
-          }
+          const [src, mapped] = lines[i].split(",").map(s => s.trim());
+          if (src === idCol.a) { newIdCol.b = mapped; count++; }
+          else if (colsA.includes(src)) { newElemCols[src] = mapped; count++; }
         }
-
         setIdCol(newIdCol);
-        setElemCols({...elemCols, ...newElemCols});
-        
-        alert(`✓ Mapping loaded successfully!\n\n${mappingsApplied} column mappings applied from ${file.name}`);
-      } catch (error) {
-        console.error("Upload mapping error:", error);
-        alert("❌ Failed to load mapping file.\n\nPlease check the file format and try again.");
-      }
-    };
-    reader.onerror = () => {
-      alert("❌ Error reading file. Please try again.");
+        setElemCols({ ...elemCols, ...newElemCols });
+        alert(`✓ Mapping loaded!\n\n${count} column mappings applied from ${file.name}`);
+      } catch (err) { alert("❌ Failed to load mapping file."); }
     };
     reader.readAsText(file);
   };
 
-  const handleNext = async () => {
+  // ── Download Element Mapping Sheet (XLSX) ─────────────────────────────────
+  const downloadElemSheet = async () => {
     try {
-      setProcessing(true);
-      
-      // Validate that we have mapped columns
-      const mappedCols = Object.entries(elemCols).filter(([k, v]) => v !== "");
-      if (mappedCols.length === 0) {
-        alert("Please map at least one salary component column");
-        setProcessing(false);
-        return;
+      if (!window.XLSX) {
+        await new Promise((res, rej) => {
+          const s = document.createElement("script");
+          s.src = "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js";
+          s.onload = res; s.onerror = rej; document.head.appendChild(s);
+        });
       }
+      const rows = [
+        ["Element", "Source A Column", "Source B Column", "Element Type", "Constituent of Gross"]
+      ];
+      colsA.slice(1).forEach(ca => {
+        if (ca === idCol.a) return;
+        const meta = elemMeta[ca] || {};
+        rows.push([
+          ca,                                       // Element name
+          ca,                                       // Source A column name
+          elemCols[ca] || "",                       // Source B column currently mapped to
+          meta.elemType || "Earnings",              // Element Type — user fills/edits: Earnings / Deduction / Information / Balance / Other
+          meta.inGross !== false ? "Yes" : "No",   // Constituent of Gross — Yes or No
+        ]);
+      });
+      const wb = window.XLSX.utils.book_new();
+      const ws = window.XLSX.utils.aoa_to_sheet(rows);
+      ws["!cols"] = [{wch:28},{wch:28},{wch:28},{wch:22},{wch:22}];
+      window.XLSX.utils.book_append_sheet(wb, ws, "Element Mapping");
+      const fn = `ElementMapping_${new Date().toISOString().split("T")[0]}.xlsx`;
+      window.XLSX.writeFile(wb, fn);
+      alert(`✓ Element mapping sheet downloaded!\n\nFile: ${fn}\n\nColumns:\n• Element — element name\n• Source A Column — column from ${labelA}\n• Source B Column — column from ${labelB} (currently mapped)\n• Element Type — Earnings / Deduction / Information / Balance / Other\n• Constituent of Gross — Yes / No\n\nFill in Element Type and Constituent of Gross, then upload it back.`);
+    } catch (err) { alert("❌ Download failed: " + err.message); }
+  };
 
-      // Small delay to show processing state
-      await new Promise(resolve => setTimeout(resolve, 300));
+  // ── Upload Element Mapping Sheet ──────────────────────────────────────────
+  const uploadElemSheet = async (file) => {
+    try {
+      if (!window.XLSX) {
+        await new Promise((res, rej) => {
+          const s = document.createElement("script");
+          s.src = "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js";
+          s.onload = res; s.onerror = rej; document.head.appendChild(s);
+        });
+      }
+      const buf = await file.arrayBuffer();
+      const wb = window.XLSX.read(new Uint8Array(buf), { type:"array" });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const rows = window.XLSX.utils.sheet_to_json(ws, { header:1 });
+      const newElemCols = { ...elemCols };
+      const newMeta = { ...elemMeta };
+      let count = 0;
+      for (let i = 1; i < rows.length; i++) {
+        // cols: Element, Source A, Source B Mapped, Element Type, Constituent of Gross
+        const [, srcA, srcB, elemType, inGrossStr] = rows[i];
+        const ca = String(srcA || "").trim();
+        if (!ca || !colsA.includes(ca)) continue;
+        if (srcB !== undefined) newElemCols[ca] = String(srcB).trim();
+        newMeta[ca] = {
+          elemType: ELEM_TYPES.includes(elemType) ? elemType : (newMeta[ca]?.elemType || "Earnings"),
+          inGross: String(inGrossStr||"").toLowerCase().trim() !== "no",
+        };
+        count++;
+      }
+      setElemCols(newElemCols);
+      setElemMeta(newMeta);
+      alert(`✓ Element mapping sheet applied!\n\n${count} elements updated.`);
+    } catch (err) { alert("❌ Upload failed: " + err.message); }
+  };
 
-      const mapA = {};
-      const mapB = {};
-      
-      // Process Source A data
+  // ── Process & continue ─────────────────────────────────────────────────────
+  const handleNext = async () => {
+    setProcessing(true);
+    try {
+      const mappedCols = Object.entries(elemCols).filter(([, v]) => v !== "");
+      if (mappedCols.length === 0) {
+        alert("Please map at least one salary component column.");
+        setProcessing(false); return;
+      }
+      await new Promise(r => setTimeout(r, 300));
+
+      const parseNum = v => { const n = parseFloat(String(v||"").replace(/[^\d.-]/g,"")); return isNaN(n)?0:n; };
+      const mapA = {}, mapB = {};
+
       dataA.forEach(row => {
-        const id = String(row[idCol.a] || "").trim();
-        if (id) {
-          mapA[id] = {};
-          Object.keys(elemCols).forEach(ca => {
-            const val = row[ca];
-            const numVal = val ? parseFloat(String(val).replace(/[^\d.-]/g, "")) : 0;
-            mapA[id][ca] = isNaN(numVal) ? 0 : numVal;
-          });
-          mapA[id].net = Object.values(mapA[id]).reduce((s, v) => s + (v || 0), 0);
-        }
-      });
-      
-      // Process Source B data
-      dataB.forEach(row => {
-        const id = String(row[idCol.b] || "").trim();
-        if (id) {
-          mapB[id] = {};
-          Object.keys(elemCols).forEach(ca => {
-            const cb = elemCols[ca];
-            const val = cb ? row[cb] : null;
-            const numVal = val ? parseFloat(String(val).replace(/[^\d.-]/g, "")) : 0;
-            mapB[id][ca] = isNaN(numVal) ? 0 : numVal;
-          });
-          mapB[id].net = Object.values(mapB[id]).reduce((s, v) => s + (v || 0), 0);
-        }
+        const id = String(row[idCol.a]||"").trim(); if (!id) return;
+        mapA[id] = {};
+        Object.keys(elemCols).forEach(ca => { mapA[id][ca] = parseNum(row[ca]); });
+        mapA[id].net = Object.values(mapA[id]).reduce((s,v)=>s+(v||0),0);
       });
 
-      // Combine all unique IDs
+      dataB.forEach(row => {
+        const id = String(row[idCol.b]||"").trim(); if (!id) return;
+        mapB[id] = {};
+        Object.keys(elemCols).forEach(ca => {
+          const cb = elemCols[ca];
+          mapB[id][ca] = cb ? parseNum(row[cb]) : 0;
+        });
+        mapB[id].net = Object.values(mapB[id]).reduce((s,v)=>s+(v||0),0);
+      });
+
       const allIds = new Set([...Object.keys(mapA), ...Object.keys(mapB)]);
       const results = Array.from(allIds).map(id => ({ id, a: mapA[id], b: mapB[id] }));
-      
-      // Build element keys and labels
+
       const elemKeys = Object.keys(elemCols).filter(k => elemCols[k] !== "");
-      const elemLabels = elemKeys.reduce((acc, k) => { 
-        acc[k] = k.charAt(0).toUpperCase() + k.slice(1); 
-        return acc; 
+      const elemLabels = elemKeys.reduce((acc, k) => {
+        acc[k] = k.charAt(0).toUpperCase() + k.slice(1); return acc;
       }, {});
       elemLabels.net = "Net Pay";
 
-      console.log("Reconciliation data prepared:", {
-        totalRecords: results.length,
-        elemKeys,
-        sourceARecords: Object.keys(mapA).length,
-        sourceBRecords: Object.keys(mapB).length,
+      const elemConfig = {};
+      elemKeys.forEach(k => {
+        const m = elemMeta[k] || {};
+        elemConfig[k] = { elemType: m.elemType || "Earnings", inGross: m.inGross !== false, loadMethod:"Interface", dataSource:"Uploaded" };
       });
 
       setProcessing(false);
-      onNext({ results, elemKeys, elemLabels, labelA, labelB });
-    } catch (error) {
-      console.error("Mapping error:", error);
-      alert(`Error processing data: ${error.message}. Please check your file format.`);
+      onNext({ results, elemKeys, elemLabels, labelA, labelB, elemConfig });
+    } catch (err) {
+      alert(`Error: ${err.message}`);
       setProcessing(false);
     }
   };
 
   return (
-    <div style={{ maxWidth:1000, margin:"0 auto" }}>
+    <div style={{ maxWidth:1100, margin:"0 auto" }}>
+      {/* Header row with all 4 action buttons */}
       <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:24 }}>
         <h2 style={{ fontSize:28, fontWeight:700 }}>Column Mapping</h2>
-        <div style={{ display:"flex", gap:12 }}>
-          <button style={gs.btn("ghost")} onClick={downloadMapping}>
-            📥 Download Mapping
-          </button>
-          <label style={gs.btn("ghost")}>
+        <div style={{ display:"flex", gap:10, flexWrap:"wrap" }}>
+          {/* Original mapping CSV buttons */}
+          <button style={gs.btn("ghost")} onClick={downloadMapping}>📥 Download Mapping</button>
+          <label style={{...gs.btn("ghost"), cursor:"pointer"}}>
             📤 Upload Mapping
-            <input 
-              type="file" 
-              accept=".csv" 
-              onChange={(e) => e.target.files[0] && uploadMapping(e.target.files[0])}
-              style={{ display: 'none' }}
-            />
+            <input type="file" accept=".csv" onChange={e=>e.target.files[0]&&uploadMapping(e.target.files[0])} style={{display:"none"}}/>
+          </label>
+          {/* New element mapping sheet buttons */}
+          <button style={{...gs.btn("ghost"), borderColor:C.accent, color:C.accent}} onClick={downloadElemSheet}>
+            📋 Download Element Sheet
+          </button>
+          <label style={{...gs.btn("ghost"), borderColor:C.accent, color:C.accent, cursor:"pointer"}}>
+            📋 Upload Element Sheet
+            <input type="file" accept=".xlsx,.xls,.csv" onChange={e=>e.target.files[0]&&uploadElemSheet(e.target.files[0])} style={{display:"none"}}/>
           </label>
         </div>
       </div>
-      
-      {/* Data Preview */}
+
+      {/* Data preview info */}
       <div style={{ ...gs.card, background:C.accent+"0A", border:`1px solid ${C.accent}44`, marginBottom:20 }}>
         <h4 style={{ fontSize:14, fontWeight:700, marginBottom:8, color:C.accent }}>📋 Data Preview</h4>
         <div style={{ fontSize:13, color:C.textDim }}>
           Source A: {dataA.length} records • Source B: {dataB.length} records
         </div>
-        <div style={{ fontSize:12, color:C.textDim, marginTop:8 }}>
-          💡 Tip: Auto-suggested mappings are shown below. Download the mapping, modify it in Excel, and upload it back.
+        <div style={{ fontSize:12, color:C.textDim, marginTop:6 }}>
+          💡 Map each Source A column to its Source B equivalent. Use <strong>Download Element Sheet</strong> to get an Excel file pre-filled with all elements — add Element Type and Gross flag, then upload it back to apply in bulk.
         </div>
       </div>
 
       <div style={gs.card}>
+        {/* ID column */}
         <h3 style={{ fontSize:18, fontWeight:700, marginBottom:16 }}>Employee ID Column</h3>
         <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:20, marginBottom:30 }}>
           <div>
@@ -1371,30 +1396,66 @@ function MappingView({ dataA, dataB, labelA, labelB, onNext }) {
             </select>
           </div>
         </div>
-        <h3 style={{ fontSize:18, fontWeight:700, marginBottom:16 }}>Salary Components</h3>
+
+        {/* Salary components */}
+        <h3 style={{ fontSize:18, fontWeight:700, marginBottom:8 }}>Salary Components</h3>
         <div style={{ marginBottom:16, fontSize:12, color:C.textDim }}>
-          Map each column from Source A to the corresponding column in Source B. Select "-- Skip --" to ignore a column.
+          Map each column from Source A to the corresponding column in Source B. Select "-- Skip --" to ignore.
+          Tick <strong>In Gross</strong> to include the element when computing Gross Pay.
         </div>
+
+        {/* Table header */}
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 140px 80px 80px", gap:12, marginBottom:8, padding:"0 4px" }}>
+          <div style={{ fontSize:11, fontWeight:700, color:C.muted, textTransform:"uppercase", letterSpacing:0.5 }}>Source A Column</div>
+          <div style={{ fontSize:11, fontWeight:700, color:C.muted, textTransform:"uppercase", letterSpacing:0.5 }}>Maps to Source B Column</div>
+          <div style={{ fontSize:11, fontWeight:700, color:C.muted, textTransform:"uppercase", letterSpacing:0.5, textAlign:"center" }}>Element Type</div>
+          <div style={{ fontSize:11, fontWeight:700, color:C.muted, textTransform:"uppercase", letterSpacing:0.5, textAlign:"center" }}>In Gross</div>
+          <div style={{ fontSize:11, fontWeight:700, color:C.muted, textTransform:"uppercase", letterSpacing:0.5, textAlign:"center" }}>Confidence</div>
+        </div>
+
         {colsA.slice(1).map(ca => {
           const suggestions = autoSuggest(colsA.slice(1), colsB);
           const confidence = suggestions[ca]?.score || 0;
+          const meta = elemMeta[ca] || { elemType:"Earnings", inGross:true };
           return (
-            <div key={ca} style={{ display:"grid", gridTemplateColumns:"1fr 1fr 100px", gap:20, marginBottom:12, alignItems:"center" }}>
-              <div style={{ padding:"10px 14px", borderRadius:8, border:`1px solid ${C.border}`, background:C.surface, fontSize:14, fontWeight:600 }}>{ca}</div>
+            <div key={ca} style={{ display:"grid", gridTemplateColumns:"1fr 1fr 140px 80px 80px", gap:12, marginBottom:10, alignItems:"center" }}>
+              {/* Source A */}
+              <div style={{ padding:"10px 14px", borderRadius:8, border:`1px solid ${C.border}`, background:C.surface, fontSize:13, fontWeight:600 }}>
+                {ca}
+              </div>
+              {/* Source B dropdown */}
               <select style={gs.select} value={elemCols[ca] || ""} onChange={e => setElemCols({...elemCols, [ca]:e.target.value})}>
                 <option value="">-- Skip --</option>
                 {colsB.map(cb => <option key={cb} value={cb}>{cb}</option>)}
               </select>
-              {confidence > 0.6 && (
-                <div style={{ fontSize:11, color:C.green, fontWeight:600 }}>
-                  ✓ {Math.round(confidence * 100)}% match
-                </div>
-              )}
+              {/* Element Type */}
+              <select style={{...gs.select, fontSize:12, padding:"8px 10px"}} value={meta.elemType}
+                onChange={e => updateMeta(ca, "elemType", e.target.value)}>
+                {ELEM_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
+              </select>
+              {/* In Gross checkbox */}
+              <div style={{ display:"flex", alignItems:"center", justifyContent:"center" }}>
+                <label style={{ display:"flex", alignItems:"center", gap:6, cursor:"pointer", fontSize:12, fontWeight:600,
+                  color: meta.inGross ? C.green : C.textDim }}>
+                  <input
+                    type="checkbox"
+                    checked={meta.inGross !== false}
+                    onChange={e => updateMeta(ca, "inGross", e.target.checked)}
+                    style={{ width:16, height:16, cursor:"pointer", accentColor:C.green }}
+                  />
+                  {meta.inGross !== false ? "Yes" : "No"}
+                </label>
+              </div>
+              {/* Confidence */}
+              <div style={{ textAlign:"center", fontSize:11, fontWeight:600, color: confidence > 0.6 ? C.green : C.textDim }}>
+                {confidence > 0 ? `✓ ${Math.round(confidence * 100)}%` : "—"}
+              </div>
             </div>
           );
         })}
-        <button 
-          style={{...gs.btn("primary"), marginTop:20, opacity: processing ? 0.7 : 1}} 
+
+        <button
+          style={{...gs.btn("primary"), marginTop:20, opacity:processing?0.7:1}}
           onClick={handleNext}
           disabled={processing}
         >
@@ -1404,6 +1465,7 @@ function MappingView({ dataA, dataB, labelA, labelB, onNext }) {
     </div>
   );
 }
+
 
 // ── Results View with AI Features ─────────────────────────────────────────────
 function ResultsView({ results, elemKeys, elemLabels, labelA, labelB, onDrillDown }) {
@@ -2402,7 +2464,7 @@ function ElemTypeBadge({ type }) {
 }
 
 // ── Enhanced Drill Down View with Tabs ────────────────────────────────────────
-function DrillDownView({ emp, onBack, elemKeys, elemLabels, labelA, labelB, reviewStatuses, setReviewStatuses, comments, setComments }) {
+function DrillDownView({ emp, onBack, elemKeys, elemLabels, labelA, labelB, elemConfig, reviewStatuses, setReviewStatuses, comments, setComments }) {
   const [activeTab, setActiveTab] = useState("analysis");
   const [status, setStatus] = useState(reviewStatuses[emp.id] || "pending");
   const [comment, setComment] = useState(comments[emp.id] || "");
@@ -2410,12 +2472,25 @@ function DrillDownView({ emp, onBack, elemKeys, elemLabels, labelA, labelB, revi
   const [loadingAI, setLoadingAI] = useState(false);
   const [configAI, setConfigAI] = useState("");
   const [loadingConfig, setLoadingConfig] = useState(false);
+  const [configEdited, setConfigEdited] = useState(false);
 
-  // Config data — in real use these come from uploaded config CSV fields on emp
-  // Demo: we synthesise from emp.config if present, else fallback defaults
-  const configData = emp.config || {};
-  const lprData    = emp.lpr   || {};   // Last Payroll Run element values (legacy PPR)
-  const ytdData    = emp.ytd   || {};   // YTD structure: { legacy:{}, new:{}, periods:[] }
+  // Editable config: emp.config (demo) > elemConfig (from mapping) > defaults
+  const [configData, setConfigData] = useState(() => {
+    const base = emp.config || elemConfig || {};
+    const defaults = {};
+    elemKeys.forEach(k => {
+      defaults[k] = base[k] || { elemType:"Earnings", loadMethod:"Interface", inGross:true, dataSource:"" };
+    });
+    return defaults;
+  });
+
+  const updateConfig = (key, field, value) => {
+    setConfigData(prev => ({ ...prev, [key]: { ...prev[key], [field]: value } }));
+    setConfigEdited(true);
+  };
+
+  const lprData    = emp.lpr   || {};
+  const ytdData    = emp.ytd   || {};
 
   useEffect(() => { runComponentAnalysis(); }, []);
 
@@ -2464,12 +2539,19 @@ function DrillDownView({ emp, onBack, elemKeys, elemLabels, labelA, labelB, revi
   }));
 
   // ── Gross composition ──────────────────────────────────────────────────────
+  // grossA/grossB: the "Gross" header value from the data (the declared gross)
   const grossA = emp.a?.gross || 0;
   const grossB = emp.b?.gross || 0;
-  const grossElems = elemKeys.filter(k => k !== "gross" && k !== "net" && k !== "pf" && k !== "tax");
-  const sumA = grossElems.reduce((s,k) => s + (emp.a?.[k] || 0), 0);
-  const sumB = grossElems.reduce((s,k) => s + (emp.b?.[k] || 0), 0);
-  const grossDiffA = grossA - sumA;   // deviation: Gross header vs sum of parts
+  // All mapped elements except the gross/net totals themselves
+  const allElemsCandidates = elemKeys.filter(k => k !== "gross" && k !== "net");
+  // inGrossElems: those the user flagged inGross:true in config/mapping — these CONSTITUTE gross
+  const inGrossElems = allElemsCandidates.filter(k => configData[k]?.inGross !== false);
+  // grossElems: all candidates shown in the table (both in and out of gross, for visibility)
+  const grossElems = allElemsCandidates;
+  // sumA/sumB: sum of only the inGross:true elements — this is how gross is built up
+  const sumA = inGrossElems.reduce((s,k) => s + (emp.a?.[k] || 0), 0);
+  const sumB = inGrossElems.reduce((s,k) => s + (emp.b?.[k] || 0), 0);
+  const grossDiffA = grossA - sumA;
   const grossDiffB = grossB - sumB;
 
   // ── YTD cumulative ────────────────────────────────────────────────────────
@@ -2819,19 +2901,43 @@ function DrillDownView({ emp, onBack, elemKeys, elemLabels, labelA, labelB, revi
             </tbody>
           </table>
 
-          {/* Pie chart of gross composition */}
-          {grossElems.length > 0 && (
-            <div style={{ marginTop:24 }}>
-              <div style={{ fontSize:14, fontWeight:600, marginBottom:12 }}>Gross Split — New System</div>
-              <ResponsiveContainer width="100%" height={220}>
-                <PieChart>
-                  <Pie data={grossElems.map((k,i) => ({ name:elemLabels[k], value:emp.b?.[k]||0 }))}
-                    dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={80} label={({name,percent})=>`${name} ${(percent*100).toFixed(0)}%`}>
-                    {grossElems.map((_,i) => (
-                      <Cell key={i} fill={[C.accent,C.purple,C.green,C.amber,C.red,"#06b6d4","#ec4899"][i%7]}/>
+          {/* Pie chart of gross composition — only inGross:true elements */}
+          {inGrossElems.length > 0 && (
+            <div style={{ marginTop:28 }}>
+              <div style={{ fontSize:14, fontWeight:600, marginBottom:4 }}>Gross Composition — New System</div>
+              <div style={{ fontSize:12, color:C.textDim, marginBottom:16 }}>
+                Only elements marked <strong>In Gross = Yes</strong> are shown. Sum = {fmt(sumB)}.
+              </div>
+              <ResponsiveContainer width="100%" height={320}>
+                <PieChart margin={{ top:10, right:30, bottom:10, left:30 }}>
+                  <Pie
+                    data={inGrossElems.map(k => ({ name: elemLabels[k], value: emp.b?.[k] || 0 }))}
+                    dataKey="value"
+                    nameKey="name"
+                    cx="50%"
+                    cy="50%"
+                    innerRadius={60}
+                    outerRadius={110}
+                    paddingAngle={3}
+                  >
+                    {inGrossElems.map((_, i) => (
+                      <Cell key={i} fill={[C.accent, C.purple, C.green, C.amber, "#06b6d4", "#ec4899", "#f97316"][i % 7]}/>
                     ))}
                   </Pie>
-                  <Tooltip formatter={v=>fmt(v)}/>
+                  <Tooltip formatter={(v, name) => [fmt(v), name]}/>
+                  <Legend
+                    layout="horizontal"
+                    verticalAlign="bottom"
+                    align="center"
+                    iconType="circle"
+                    iconSize={10}
+                    formatter={(value, entry) => {
+                      const total = inGrossElems.reduce((s, k) => s + (emp.b?.[k] || 0), 0);
+                      const val = entry.payload?.value || 0;
+                      const pct = total > 0 ? ((val / total) * 100).toFixed(1) : 0;
+                      return `${value} (${pct}%)`;
+                    }}
+                  />
                 </PieChart>
               </ResponsiveContainer>
             </div>
@@ -2845,79 +2951,107 @@ function DrillDownView({ emp, onBack, elemKeys, elemLabels, labelA, labelB, revi
           <div style={gs.card}>
             <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:16 }}>
               <div>
-                <h3 style={{ fontSize:17, fontWeight:700, marginBottom:4 }}>Element Configuration Check</h3>
+                <h3 style={{ fontSize:17, fontWeight:700, marginBottom:4 }}>
+                  Element Configuration Check
+                  {configEdited && <span style={{ fontSize:11, color:C.amber, marginLeft:10, fontWeight:600 }}>● Unsaved edits</span>}
+                </h3>
                 <p style={{ fontSize:13, color:C.textDim }}>
-                  How each element was loaded into the system, its classification, and whether it is correctly included in Gross.
-                  Applicable globally — especially relevant for UK LDG migration scenarios.
+                  Edit element type, load method, data source and Gross inclusion directly in the table.
+                  Changes are reflected immediately in Gross Composition and LPR tabs for this session.
                 </p>
               </div>
-              <button style={{ ...gs.btn("primary"), fontSize:12, padding:"8px 14px", whiteSpace:"nowrap" }}
-                onClick={runConfigAI} disabled={loadingConfig}>
-                {loadingConfig ? "🤖 Checking…" : "🤖 AI Config Review"}
-              </button>
+              <div style={{ display:"flex", gap:8 }}>
+                {configEdited && (
+                  <button style={{ ...gs.btn("ghost"), fontSize:12, padding:"8px 14px" }}
+                    onClick={() => { setConfigData(elemKeys.reduce((acc,k)=>{acc[k]=emp.config?.[k]||{elemType:"Earnings",loadMethod:"Interface",inGross:true,dataSource:""};return acc;},{})); setConfigEdited(false); }}>
+                    ↩ Reset
+                  </button>
+                )}
+                <button style={{ ...gs.btn("primary"), fontSize:12, padding:"8px 14px", whiteSpace:"nowrap" }}
+                  onClick={runConfigAI} disabled={loadingConfig}>
+                  {loadingConfig ? "🤖 Checking…" : "🤖 AI Config Review"}
+                </button>
+              </div>
             </div>
 
-            <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13, marginBottom:20 }}>
-              <thead>
-                <tr style={{ background:C.bg, borderBottom:`2px solid ${C.border}` }}>
-                  <th style={{ padding:"10px 14px", textAlign:"left", fontWeight:700 }}>Element</th>
-                  <th style={{ padding:"10px 14px", textAlign:"center", fontWeight:700 }}>Element Type</th>
-                  <th style={{ padding:"10px 14px", textAlign:"center", fontWeight:700 }}>Load Method</th>
-                  <th style={{ padding:"10px 14px", textAlign:"center", fontWeight:700 }}>In Gross</th>
-                  <th style={{ padding:"10px 14px", textAlign:"center", fontWeight:700 }}>Data Source</th>
-                  <th style={{ padding:"10px 14px", textAlign:"center", fontWeight:700 }}>Migration Element</th>
-                  <th style={{ padding:"10px 14px", textAlign:"center", fontWeight:700 }}>Config Risk</th>
-                </tr>
-              </thead>
-              <tbody>
-                {elemKeys.map(k => {
-                  const cfg      = configData[k] || {};
-                  const isMig    = cfg.loadMethod === "Migration";
-                  const inGross  = cfg.inGross !== false;
-                  const badType  = cfg.elemType === "Information" && inGross;  // Info elements shouldn't feed Gross
-                  const risk     = isMig ? "Migration" : badType ? "Config Error" : "OK";
-                  const riskC    = risk === "Migration" ? C.amber : risk === "Config Error" ? C.red : C.green;
-                  return (
-                    <tr key={k} style={{ borderBottom:`1px solid ${C.border}`, background: risk!=="OK" ? riskC+"08" : "transparent" }}>
-                      <td style={{ padding:"10px 14px", fontWeight:600 }}>{elemLabels[k]}</td>
-                      <td style={{ padding:"10px 14px", textAlign:"center" }}>
-                        <ElemTypeBadge type={cfg.elemType || "Earnings"}/>
-                      </td>
-                      <td style={{ padding:"10px 14px", textAlign:"center" }}>
-                        <LoadMethodBadge method={cfg.loadMethod || "Interface"}/>
-                      </td>
-                      <td style={{ padding:"10px 14px", textAlign:"center" }}>
-                        {inGross ? <span style={gs.badge(C.green)}>✓ Yes</span> : <span style={gs.badge(C.red)}>✗ No</span>}
-                      </td>
-                      <td style={{ padding:"10px 14px", textAlign:"center", fontSize:12, color:C.textDim }}>
-                        {cfg.dataSource || "System Generated"}
-                      </td>
-                      <td style={{ padding:"10px 14px", textAlign:"center" }}>
-                        {isMig
-                          ? <span style={gs.badge(C.amber)}>⚠ Migration</span>
-                          : <span style={gs.badge(C.green)}>Live</span>}
-                      </td>
-                      <td style={{ padding:"10px 14px", textAlign:"center" }}>
-                        <span style={gs.badge(riskC)}>
-                          {risk === "OK" ? "✓ OK" : risk === "Migration" ? "⚠ Review" : "✗ Error"}
-                        </span>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+            <div style={{ overflowX:"auto" }}>
+              <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12, marginBottom:20 }}>
+                <thead>
+                  <tr style={{ background:C.bg, borderBottom:`2px solid ${C.border}` }}>
+                    <th style={{ padding:"10px 12px", textAlign:"left", fontWeight:700 }}>Element</th>
+                    <th style={{ padding:"10px 12px", textAlign:"center", fontWeight:700 }}>Element Type ✏</th>
+                    <th style={{ padding:"10px 12px", textAlign:"center", fontWeight:700 }}>Load Method ✏</th>
+                    <th style={{ padding:"10px 12px", textAlign:"center", fontWeight:700 }}>In Gross ✏</th>
+                    <th style={{ padding:"10px 12px", textAlign:"left", fontWeight:700 }}>Data Source ✏</th>
+                    <th style={{ padding:"10px 12px", textAlign:"center", fontWeight:700 }}>Migration?</th>
+                    <th style={{ padding:"10px 12px", textAlign:"center", fontWeight:700 }}>Config Risk</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {elemKeys.map(k => {
+                    const cfg     = configData[k] || {};
+                    const isMig   = cfg.loadMethod === "Migration";
+                    const inGross = cfg.inGross !== false;
+                    const badType = cfg.elemType === "Information" && inGross;
+                    const risk    = isMig ? "Migration" : badType ? "Config Error" : "OK";
+                    const riskC   = risk === "Migration" ? C.amber : risk === "Config Error" ? C.red : C.green;
+                    return (
+                      <tr key={k} style={{ borderBottom:`1px solid ${C.border}`, background: risk!=="OK" ? riskC+"08" : "transparent" }}>
+                        <td style={{ padding:"8px 12px", fontWeight:600 }}>{elemLabels[k]}</td>
+                        {/* Element Type — editable select */}
+                        <td style={{ padding:"8px 12px", textAlign:"center" }}>
+                          <select value={cfg.elemType||"Earnings"}
+                            onChange={e=>updateConfig(k,"elemType",e.target.value)}
+                            style={{ ...gs.select, padding:"5px 8px", fontSize:11, border:`1px solid ${ELEM_TYPE_COLORS[cfg.elemType]||C.border}44` }}>
+                            {ELEM_TYPES.map(t=><option key={t} value={t}>{t}</option>)}
+                          </select>
+                        </td>
+                        {/* Load Method — editable select */}
+                        <td style={{ padding:"8px 12px", textAlign:"center" }}>
+                          <select value={cfg.loadMethod||"Interface"}
+                            onChange={e=>updateConfig(k,"loadMethod",e.target.value)}
+                            style={{ ...gs.select, padding:"5px 8px", fontSize:11, border:`1px solid ${LOAD_METHOD_COLORS[cfg.loadMethod]||C.border}44` }}>
+                            {["Manual","Interface","Migration","Formula"].map(m=><option key={m} value={m}>{m}</option>)}
+                          </select>
+                        </td>
+                        {/* In Gross — toggle button */}
+                        <td style={{ padding:"8px 12px", textAlign:"center" }}>
+                          <button onClick={()=>updateConfig(k,"inGross",!inGross)}
+                            style={{ padding:"5px 12px", borderRadius:6, fontSize:11, fontWeight:700, cursor:"pointer", border:"none",
+                              background: inGross ? C.green+"22" : C.red+"22", color: inGross ? C.green : C.red }}>
+                            {inGross ? "✓ Yes" : "✗ No"}
+                          </button>
+                        </td>
+                        {/* Data Source — editable text */}
+                        <td style={{ padding:"8px 12px" }}>
+                          <input value={cfg.dataSource||""} placeholder="e.g. HR System"
+                            onChange={e=>updateConfig(k,"dataSource",e.target.value)}
+                            style={{ ...gs.input, padding:"5px 8px", fontSize:11, width:"100%" }}/>
+                        </td>
+                        <td style={{ padding:"8px 12px", textAlign:"center" }}>
+                          {isMig ? <span style={gs.badge(C.amber)}>⚠ Migration</span> : <span style={gs.badge(C.green)}>Live</span>}
+                        </td>
+                        <td style={{ padding:"8px 12px", textAlign:"center" }}>
+                          <span style={gs.badge(riskC)}>
+                            {risk === "OK" ? "✓ OK" : risk === "Migration" ? "⚠ Review" : "✗ Error"}
+                          </span>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
 
             {/* Legend */}
-            <div style={{ display:"flex", gap:16, flexWrap:"wrap", padding:"12px 0", borderTop:`1px solid ${C.border}`, fontSize:12, color:C.textDim }}>
-              <div><span style={{ fontWeight:700, color:C.green }}>Manual</span> — Directly entered by payroll team</div>
-              <div><span style={{ fontWeight:700, color:C.accent }}>Interface</span> — Fed via HR/benefits integration</div>
-              <div><span style={{ fontWeight:700, color:C.amber }}>Migration</span> — Loaded during data migration; verify balance initialisation</div>
-              <div><span style={{ fontWeight:700, color:C.green }}>Formula</span> — Calculated by payroll engine</div>
+            <div style={{ display:"flex", gap:16, flexWrap:"wrap", padding:"10px 0", borderTop:`1px solid ${C.border}`, fontSize:11, color:C.textDim }}>
+              <div><span style={{ fontWeight:700, color:"#8B5CF6" }}>Manual</span> — Directly entered</div>
+              <div><span style={{ fontWeight:700, color:C.accent }}>Interface</span> — HR/benefits feed</div>
+              <div><span style={{ fontWeight:700, color:C.amber }}>Migration</span> — From legacy; verify balance initialisation</div>
+              <div><span style={{ fontWeight:700, color:C.green }}>Formula</span> — Payroll engine calculated</div>
             </div>
           </div>
 
-          {/* AI Config Review result */}
           {configAI && (
             <div style={{ ...gs.card, background:C.purple+"08", border:`1px solid ${C.purple}33` }}>
               <h4 style={{ fontSize:15, fontWeight:700, marginBottom:12, color:C.purple }}>🤖 AI Configuration Review</h4>
@@ -3300,6 +3434,7 @@ export default function App() {
             elemLabels={reconData.elemLabels}
             labelA={reconData.labelA}
             labelB={reconData.labelB}
+            elemConfig={reconData.elemConfig || {}}
             reviewStatuses={reviewStatuses}
             setReviewStatuses={setReviewStatuses}
             comments={comments}
