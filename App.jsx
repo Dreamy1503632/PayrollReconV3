@@ -322,14 +322,54 @@ function readFileMeta(file) {
   });
 }
 
-function parseSheetFromMeta(meta, sheetName) {
+function parseSheetFromMeta(meta, sheetName, forceTranspose) {
   if (meta.ext === "csv" || meta.ext === "tsv" || meta.ext === "txt") {
-    return parseCSV(meta.text);
+    const rows = parseCSV(meta.text);
+    return forceTranspose ? transposeRows(rows) : rows;
   }
   const wb = window.XLSX.read(new Uint8Array(meta.rawBuffer), { type:"array" });
   const ws = wb.Sheets[sheetName || wb.SheetNames[0]];
   if (!ws) throw new Error(`Sheet "${sheetName}" not found`);
+  // Always read as 2D first so we can check orientation
+  const raw = window.XLSX.utils.sheet_to_json(ws, { header:1, defval:"" });
+  if (!raw || raw.length === 0) return [];
+  const numRows = raw.length;
+  const numCols = Math.max(...raw.map(r => r.length));
+  // Auto-detect column-oriented layout OR honour manual override:
+  // Column-oriented = many more columns than rows (employees as columns, elements as rows)
+  // Heuristic: cols > rows * 1.5 AND rows <= 100 (short element list) AND cols > 5
+  const shouldTranspose = forceTranspose || (numCols > numRows * 1.5 && numRows <= 100 && numCols > 5);
+  if (shouldTranspose) {
+    return transposeRaw(raw);
+  }
   return window.XLSX.utils.sheet_to_json(ws, { defval:"" });
+}
+
+// Transpose already-parsed row-objects (for CSV): keys of first object become records
+function transposeRows(rows) {
+  if (!rows || rows.length === 0) return rows;
+  // Convert row objects → 2D array, then transpose
+  const headers = Object.keys(rows[0]);
+  const raw = [headers, ...rows.map(r => headers.map(h => r[h] ?? ""))];
+  // After transpose: raw[0][0] is top-left (ignore), raw[i][0] is field name, raw[i][j] is value for record j
+  return transposeRaw(raw);
+}
+
+// Transposes a 2D array where raw[i][0] = field name, raw[i][j] = value for employee j
+function transposeRaw(raw) {
+  if (!raw || raw.length < 2) return [];
+  const fieldNames = raw.map(r => String(r[0] || "").trim());
+  const numRecords = Math.max(...raw.map(r => r.length)) - 1;
+  const result = [];
+  for (let col = 1; col <= numRecords; col++) {
+    const record = {};
+    raw.forEach((r, rowIdx) => {
+      const key = fieldNames[rowIdx];
+      if (key) record[key] = r[col] ?? "";
+    });
+    if (Object.values(record).some(v => v !== "")) result.push(record);
+  }
+  return result;
 }
 
 // Legacy compat — used by PDF/Excel export paths that don't need sheet selection
@@ -967,6 +1007,8 @@ function UploadView({ onDemoNext, onRealNext }) {
   const [sheetB, setSheetB] = useState("");
   const [loadingA, setLoadingA] = useState(false);
   const [loadingB, setLoadingB] = useState(false);
+  const [transposeA, setTransposeA] = useState(false);
+  const [transposeB, setTransposeB] = useState(false);
 
   const handleFileChange = async (which, file) => {
     if (!file) return;
@@ -998,8 +1040,8 @@ function UploadView({ onDemoNext, onRealNext }) {
     setLoading(true);
     setError("");
     try {
-      const dataA = parseSheetFromMeta(metaA, sheetA);
-      const dataB = parseSheetFromMeta(metaB, sheetB);
+      const dataA = parseSheetFromMeta(metaA, sheetA, transposeA);
+      const dataB = parseSheetFromMeta(metaB, sheetB, transposeB);
       if (dataA.length === 0 || dataB.length === 0) throw new Error("One or both selected sheets are empty.");
       onRealNext({ dataA, dataB, labelA, labelB });
     } catch (err) {
@@ -1065,7 +1107,7 @@ function UploadView({ onDemoNext, onRealNext }) {
   }
 
   // ── Real Data Upload ──────────────────────────────────────────────────────
-  const FileBlock = ({ which, label, setLabel, labelPlaceholder, meta, sheet, setSheet, loadingFile }) => (
+  const FileBlock = ({ which, label, setLabel, labelPlaceholder, meta, sheet, setSheet, loadingFile, transpose, setTranspose }) => (
     <div style={{ padding:20, borderRadius:10, border:`1px solid ${C.border}`, background:C.bg, marginBottom:20 }}>
       <div style={{ fontSize:13, fontWeight:700, color:C.accent, marginBottom:12 }}>
         Source {which}
@@ -1117,6 +1159,14 @@ function UploadView({ onDemoNext, onRealNext }) {
           ) : (
             <div style={{ fontSize:12, color:C.textDim }}>Single sheet: <strong>{sheet}</strong></div>
           )}
+          {/* Transpose toggle — shown once file is loaded */}
+          <div style={{ marginTop:12, padding:"10px 14px", borderRadius:8, background: transpose ? C.amber+"15" : C.bg, border:`1px solid ${transpose ? C.amber : C.border}`, display:"flex", alignItems:"center", gap:12 }}>
+            <label style={{ display:"flex", alignItems:"center", gap:8, cursor:"pointer", fontSize:13, fontWeight:600 }}>
+              <input type="checkbox" checked={!!transpose} onChange={e => setTranspose(e.target.checked)} style={{ width:15, height:15, cursor:"pointer" }}/>
+              Transpose this sheet (elements are rows, employees are columns)
+            </label>
+            {transpose && <span style={{ fontSize:11, color:C.amber }}>⚠ First column will be treated as field names</span>}
+          </div>
         </div>
       )}
     </div>
@@ -1127,9 +1177,9 @@ function UploadView({ onDemoNext, onRealNext }) {
       <h2 style={{ fontSize:28, fontWeight:700, marginBottom:24 }}>Upload Payroll Files</h2>
       <div style={gs.card}>
         <FileBlock which="A" label={labelA} setLabel={setLabelA} labelPlaceholder="e.g., Oracle Fusion HCM — Jul 2025"
-          meta={metaA} sheet={sheetA} setSheet={setSheetA} loadingFile={loadingA}/>
+          meta={metaA} sheet={sheetA} setSheet={setSheetA} loadingFile={loadingA} transpose={transposeA} setTranspose={setTransposeA}/>
         <FileBlock which="B" label={labelB} setLabel={setLabelB} labelPlaceholder="e.g., RAMCO Payroll — Jul 2025"
-          meta={metaB} sheet={sheetB} setSheet={setSheetB} loadingFile={loadingB}/>
+          meta={metaB} sheet={sheetB} setSheet={setSheetB} loadingFile={loadingB} transpose={transposeB} setTranspose={setTransposeB}/>
         {error && (
           <div style={{ ...gs.badge(C.red), marginBottom:16, padding:"12px 16px", fontSize:13, display:"block" }}>
             ⚠ {error}
@@ -1305,11 +1355,24 @@ function MappingView({ dataA, dataB, labelA, labelB, onNext }) {
       const parseNum = v => { const n = parseFloat(String(v||"").replace(/[^\d.-]/g,"")); return isNaN(n)?0:n; };
       const mapA = {}, mapB = {};
 
+      // Find any explicitly mapped Source A column whose name contains "net" (case-insensitive)
+      // This column's value must be read directly and aliased to .net — never auto-summed
+      const netKeyA = Object.keys(elemCols).find(k => /net/i.test(k) && elemCols[k] !== "");
+      const netKeyB = netKeyA ? elemCols[netKeyA] : null;
+
       dataA.forEach(row => {
         const id = String(row[idCol.a]||"").trim(); if (!id) return;
         mapA[id] = {};
         Object.keys(elemCols).forEach(ca => { mapA[id][ca] = parseNum(row[ca]); });
-        mapA[id].net = Object.values(mapA[id]).reduce((s,v)=>s+(v||0),0);
+        // Alias the real net column to .net so all downstream code that reads emp.a.net gets the right value
+        if (netKeyA && mapA[id][netKeyA] !== undefined) {
+          mapA[id].net = mapA[id][netKeyA];
+        } else {
+          // No net column mapped — auto-calculate from non-gross/non-net elements
+          mapA[id].net = Object.entries(mapA[id])
+            .filter(([k]) => !/net/i.test(k) && !/gross/i.test(k))
+            .reduce((s, [, v]) => s + (v || 0), 0);
+        }
       });
 
       dataB.forEach(row => {
@@ -1319,7 +1382,13 @@ function MappingView({ dataA, dataB, labelA, labelB, onNext }) {
           const cb = elemCols[ca];
           mapB[id][ca] = cb ? parseNum(row[cb]) : 0;
         });
-        mapB[id].net = Object.values(mapB[id]).reduce((s,v)=>s+(v||0),0);
+        if (netKeyB && netKeyA && mapB[id][netKeyA] !== undefined) {
+          mapB[id].net = mapB[id][netKeyA];
+        } else {
+          mapB[id].net = Object.entries(mapB[id])
+            .filter(([k]) => !/net/i.test(k) && !/gross/i.test(k))
+            .reduce((s, [, v]) => s + (v || 0), 0);
+        }
       });
 
       const allIds = new Set([...Object.keys(mapA), ...Object.keys(mapB)]);
